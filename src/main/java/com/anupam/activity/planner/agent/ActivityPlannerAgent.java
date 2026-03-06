@@ -28,7 +28,7 @@ public class ActivityPlannerAgent {
     private static BaseAgent initAgent() {
         return LlmAgent.builder()
                 .name("activity-agent")
-                .description("Recommends activities and helps plan activities for travel destinations")
+                .description("Recommends activities and helps plan activities for travel destinations with weather and risk awareness")
                 .instruction("""
                         You are an activity planning assistant for the intelligent travel platform.
                         You help users with:
@@ -38,7 +38,22 @@ public class ActivityPlannerAgent {
                         - Finding activities suitable for specific times of day
                         - Providing activity booking information
                         
-                        Use the available tools to provide personalized activity recommendations.
+                        IMPORTANT: When you receive coordinated response data that includes:
+                        - Weather information (temperature, conditions, seasonal info)
+                        - Travel information (itinerary, duration, best areas)
+                        - Risk assessment (peak seasons, pricing, health precautions)
+                        
+                        YOU MUST INCLUDE ALL THIS INFORMATION in your response to the user.
+                        
+                        Structure your response as:
+                        1. WEATHER INFORMATION - Current conditions and seasonal details
+                        2. TRAVEL RECOMMENDATIONS - Best areas and timing
+                        3. RISK ASSESSMENT - Peak seasons, costs, health/safety info
+                        4. PERSONALIZED ACTIVITIES - Recommended activities based on all factors
+                        5. HEALTH & SAFETY TIPS - Required precautions and insurance info
+                        
+                        Do not filter out or omit any data sections. Present the complete coordinated response.
+                        Use the available tools to provide personalized activity recommendations with full context.
                         """)
                 .model("gemini-2.5-flash")
                 .tools(FunctionTool.create(ActivityPlannerAgent.class, "recommendActivities"))
@@ -57,9 +72,10 @@ public class ActivityPlannerAgent {
         String corrId = event.getCorrelationId();
         try {
             LOGGER.info(() -> "ActivityPlannerAgent.onActivityQuery called for city=" + city + " corrId=" + corrId);
-            // Try to fetch travel and weather via AgentRegistry (fallback synchronous calls)
+            // Try to fetch travel, weather, and risk data via AgentRegistry (fallback synchronous calls)
             Map<String, Object> travelData = new HashMap<>();
             Map<String, Object> weatherData = new HashMap<>();
+            Map<String, Object> riskData = new HashMap<>();
             try {
                 Map<String, Object> travelResp = AgentRegistry.routeToAgent("travel-agent", "Plan a trip to " + city);
                 if (travelResp != null && travelResp.containsKey("response") && travelResp.get("response") instanceof Map) {
@@ -78,7 +94,16 @@ public class ActivityPlannerAgent {
                 LOGGER.log(Level.WARNING, "ActivityPlannerAgent: failed to fetch weather agent response", ex);
             }
 
-            Map<String, Object> activityResponse = handleCoordinatedQuery(city, travelData, weatherData);
+            try {
+                Map<String, Object> riskResp = AgentRegistry.routeToAgent("risk-agent", "Assess travel risks for " + city + " including weather hazards, peak season costs, and alternative timing");
+                if (riskResp != null && riskResp.containsKey("response") && riskResp.get("response") instanceof Map) {
+                    riskData = (Map<String, Object>) riskResp.get("response");
+                }
+            } catch (Exception ex) {
+                LOGGER.log(Level.WARNING, "ActivityPlannerAgent: failed to fetch risk agent response", ex);
+            }
+
+            Map<String, Object> activityResponse = handleCoordinatedQuery(city, travelData, weatherData, riskData);
             Map<String, Object> responseData = new HashMap<>();
             if (activityResponse != null && activityResponse.containsKey("response") && activityResponse.get("response") instanceof Map) {
                 responseData = (Map<String, Object>) activityResponse.get("response");
@@ -125,13 +150,14 @@ public class ActivityPlannerAgent {
     }
 
     /**
-     * Handle coordinated activity recommendations with travel and weather data
-     * This method is called when ActivityAgent coordinates with TravelAgent and WeatherAgent
+     * Handle coordinated activity recommendations with travel, weather, and risk data
+     * This method is called when ActivityAgent coordinates with TravelAgent, WeatherAgent, and RiskAssessmentAgent
      */
     public static Map<String, Object> handleCoordinatedQuery(
             String city,
             Map<String, Object> travelData,
-            Map<String, Object> weatherData) {
+            Map<String, Object> weatherData,
+            Map<String, Object> riskData) {
 
         Map<String, Object> response = new HashMap<>();
         response.put("agent", "activity-agent");
@@ -147,9 +173,15 @@ public class ActivityPlannerAgent {
             LOGGER.info(() -> "  Travel Data content: " + (travelData != null ? travelData : "null"));
             LOGGER.info(() -> "  Weather Data type: " + (weatherData != null ? weatherData.getClass().getSimpleName() : "null"));
             LOGGER.info(() -> "  Weather Data content: " + (weatherData != null ? weatherData : "null"));
+            LOGGER.info(() -> "  Risk Data type: " + (riskData != null ? riskData.getClass().getSimpleName() : "null"));
+            LOGGER.info(() -> "  Risk Data content: " + (riskData != null ? riskData : "null"));
 
             // Combine all data for intelligent recommendations
             Map<String, Object> coordinatedActivities = new HashMap<>();
+
+            // Add comprehensive data sections
+            coordinatedActivities.put("city", city);
+            coordinatedActivities.put("coordination_complete", true);
 
             // ADD ACTUAL WEATHER AND TRAVEL DATA TO RESPONSE
             if (weatherData != null && !weatherData.isEmpty()) {
@@ -164,6 +196,13 @@ public class ActivityPlannerAgent {
                 coordinatedActivities.put("travel_information", "No travel data available");
             }
 
+            // ADD RISK ASSESSMENT DATA TO RESPONSE
+            if (riskData != null && !riskData.isEmpty()) {
+                coordinatedActivities.put("risk_assessment", riskData);
+            } else {
+                coordinatedActivities.put("risk_assessment", "No risk assessment data available");
+            }
+
             // Add weather-based recommendations
             Map<String, Object> weatherBasedActivities = generateWeatherBasedActivities(city, weatherData);
             coordinatedActivities.put("weather_based_activities", weatherBasedActivities);
@@ -172,12 +211,40 @@ public class ActivityPlannerAgent {
             Map<String, Object> travelBasedActivities = generateTravelBasedActivities(city, travelData);
             coordinatedActivities.put("travel_based_activities", travelBasedActivities);
 
+            // Add risk-based recommendations and suggestions
+            Map<String, Object> riskBasedRecommendations = generateRiskBasedRecommendations(city, riskData);
+            coordinatedActivities.put("risk_based_recommendations", riskBasedRecommendations);
+
             // Add general top activities
             Map<String, Object> topActivities = generateTopActivities(city);
             coordinatedActivities.put("top_activities", topActivities);
 
+            // Create a formatted summary for the LLM
+            StringBuilder summary = new StringBuilder();
+            summary.append("=== COMPREHENSIVE TRAVEL PLAN FOR ").append(city.toUpperCase()).append(" ===\n\n");
+
+            if (weatherData != null && !weatherData.isEmpty()) {
+                summary.append("WEATHER INFORMATION:\n");
+                summary.append("- ").append(weatherData.values().stream().map(Object::toString).reduce((a, b) -> a + ", " + b).orElse("No details")).append("\n\n");
+            }
+
+            if (travelData != null && !travelData.isEmpty()) {
+                summary.append("TRAVEL INFORMATION:\n");
+                summary.append("- ").append(travelData.values().stream().map(Object::toString).reduce((a, b) -> a + ", " + b).orElse("No details")).append("\n\n");
+            }
+
+            if (riskData != null && !riskData.isEmpty()) {
+                summary.append("RISK ASSESSMENT:\n");
+                summary.append("- ").append(riskData.values().stream().map(Object::toString).reduce((a, b) -> a + ", " + b).orElse("No details")).append("\n\n");
+            }
+
+            summary.append("Based on all available information, here are your activity recommendations:\n");
+
+            coordinatedActivities.put("summary", summary.toString());
+
             response.put("response", coordinatedActivities);
             response.put("status", "success");
+            response.put("data_available", true);
 
             LOGGER.info("ActivityPlannerAgent response prepared successfully");
 
@@ -189,6 +256,89 @@ public class ActivityPlannerAgent {
         }
 
         return response;
+    }
+
+    /**
+     * Generate risk-based recommendations and suggestions
+     */
+    private static Map<String, Object> generateRiskBasedRecommendations(String city, Map<String, Object> riskData) {
+        Map<String, Object> recommendations = new HashMap<>();
+        recommendations.put("city", city);
+        recommendations.put("based_on", "risk_assessment");
+
+        if (riskData != null && !riskData.isEmpty()) {
+            // Extract risk information
+            Object riskResponse = riskData.get("text");
+            if (riskResponse == null) {
+                riskResponse = riskData.get("response");
+            }
+
+            if (riskResponse != null) {
+                recommendations.put("risk_assessment", riskResponse.toString());
+            }
+
+            // Check for specific risk factors
+            String riskText = (riskResponse != null ? riskResponse.toString() : "").toLowerCase();
+
+            // Peak season and pricing information
+            if (riskText.contains("peak") || riskText.contains("season") || riskText.contains("expensive")) {
+                recommendations.put("season_warning", true);
+                recommendations.put("season_advice", "This destination experiences peak season with higher costs. Consider visiting during shoulder season for better prices and fewer crowds.");
+                recommendations.put("alternative_times", new String[]{
+                    "Off-season (budget-friendly, fewer tourists)",
+                    "Shoulder season (good weather, moderate prices)",
+                    "Early morning or weekday visits (avoid crowds)"
+                });
+            } else {
+                recommendations.put("season_warning", false);
+                recommendations.put("season_advice", "Good news! This destination doesn't have significant peak season pricing concerns.");
+            }
+
+            // Weather hazards
+            if (riskText.contains("weather") || riskText.contains("storm") || riskText.contains("heat") || riskText.contains("cold")) {
+                recommendations.put("weather_hazard", true);
+                recommendations.put("weather_precautions", "Monitor weather conditions before and during your trip. Pack appropriate gear and check local forecasts daily.");
+
+                if (riskText.contains("monsoon") || riskText.contains("rain")) {
+                    recommendations.put("specific_hazard", "Heavy rainfall possible - bring waterproof gear and check local roads");
+                } else if (riskText.contains("heat")) {
+                    recommendations.put("specific_hazard", "High temperatures - stay hydrated and limit outdoor activities during peak heat");
+                } else if (riskText.contains("cold") || riskText.contains("snow")) {
+                    recommendations.put("specific_hazard", "Cold weather - dress warmly and be cautious of icy conditions");
+                }
+            }
+
+            // Health and safety
+            if (riskText.contains("health") || riskText.contains("disease") || riskText.contains("safe")) {
+                recommendations.put("health_safety", true);
+                recommendations.put("health_advice", "Check travel health advisories and ensure all vaccinations are current before traveling.");
+                recommendations.put("recommended_precautions", new String[]{
+                    "Consult travel health clinic 4-6 weeks before departure",
+                    "Get required vaccinations",
+                    "Purchase travel insurance with medical coverage",
+                    "Keep medications in original containers",
+                    "Know location of nearest medical facilities"
+                });
+            }
+
+            // Insurance recommendations
+            if (riskText.contains("insurance") || riskText.contains("document")) {
+                recommendations.put("insurance_recommended", true);
+                recommendations.put("insurance_advice", "Travel insurance is highly recommended for this destination.");
+            }
+        } else {
+            recommendations.put("status", "No specific risks identified");
+            recommendations.put("advice", "This appears to be a safe destination. Standard travel precautions apply.");
+            recommendations.put("general_recommendations", new String[]{
+                "Check travel advisory before departure",
+                "Purchase travel insurance",
+                "Keep emergency contact information",
+                "Register with your embassy",
+                "Stay aware of local customs and laws"
+            });
+        }
+
+        return recommendations;
     }
 
     /**

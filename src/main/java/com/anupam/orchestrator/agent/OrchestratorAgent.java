@@ -44,26 +44,49 @@ public class OrchestratorAgent {
                         You are an intelligent orchestrator agent for a travel platform.
                         Your job is to analyze user requests and route them to the most appropriate agent or coordinator.
                         
-                        IMPORTANT: For activity-related queries that mention a city or location, ALWAYS use coordinateAgents()
-                        because you need to combine travel and weather information to provide the best activity recommendations.
+                        IMPORTANT: When you receive coordinated responses from multiple agents, ALWAYS include ALL the data in your response:
+                        - Weather information (temperature, conditions, recommendations)
+                        - Travel information (itinerary, duration, logistics)
+                        - Risk assessment (safety, health, peak seasons, pricing, alternatives)
+                        - Activity recommendations (based on all factors)
+                        
+                        DO NOT filter out or summarize away the weather, travel, or risk data.
+                        Always present the COMPLETE structured response including all these sections.
+                        
+                        For activity-related queries that mention a city or location, ALWAYS use coordinateAgents()
+                        because you need to combine travel, weather, AND risk assessment information to provide the best activity recommendations.
                         
                         Available options:
-                        1. For simple ACTIVITY queries (e.g., "activities in Boston", "what to do in Paris", "plan activities for 3 days in Boston"):
+                        1. For ACTIVITY queries (e.g., "activities in Boston", "what to do in Paris", "plan activities for 3 days in Boston"):
                            → Use 'coordinateAgents' function with the city name
-                           → This will call Travel Agent and Weather Agent in parallel
-                           → Returns coordinated activity recommendations
+                           → This will call Travel Agent, Weather Agent, AND Risk Assessment Agent in parallel
+                           → Returns comprehensive activity recommendations with risk warnings and alternative travel times
+                           → INCLUDE all weather, travel, and risk data in your response to the user
                         
                         2. For single domain queries:
                            - weather-agent: "What's the weather in Paris?" or "Temperature in London?"
                            - travel-agent: "Plan my trip to Rome" or "Create itinerary for Tokyo"
-                           - risk-agent: "Is Thailand safe?" or "Health precautions for India?"
+                           - risk-agent: "Is Thailand safe?" or "Health precautions for India?" or "Best time to visit Mexico?"
                         
                         DECISION LOGIC:
                         - If query is about "activities", "things to do", "what to do", "plan activities" → Use coordinateAgents()
                         - If query mentions multiple aspects (travel + activities + conditions) → Use coordinateAgents()
                         - Otherwise, analyze and call 'routeRequest' with the most appropriate single agent.
                         
-                        Always be helpful and use the most relevant routing method based on the user's intent.
+                        The coordinateAgents function now includes:
+                        - Travel information (itineraries, duration, logistics)
+                        - Weather conditions (current and forecasted)
+                        - Risk assessment (safety, health, peak season pricing, best times to visit)
+                        - Activity recommendations based on all three factors
+                        
+                        When returning the response, ensure the user sees:
+                        1. Weather information clearly stated
+                        2. Travel planning details
+                        3. Risk assessment including peak seasons and pricing
+                        4. Personalized activity recommendations
+                        5. Health and safety guidance
+                        
+                        Always be helpful and include ALL available information. Do not omit data sections.
                         """)
                 .model("gemini-2.5-flash")
                 .tools(
@@ -140,14 +163,14 @@ public class OrchestratorAgent {
             Map<String, Object> weatherData = null;
             try {
                 travelData = travelFuture.get(10, TimeUnit.SECONDS);
-            } catch (TimeoutException te) {
-                LOGGER.log(Level.WARNING, "[OrchestratorAgent] Travel agent timeout for corrId=" + corrId, te);
+            } catch (TimeoutException | InterruptedException | ExecutionException te) {
+                LOGGER.log(Level.WARNING, "[OrchestratorAgent] Travel agent timeout/error for corrId=" + corrId);
             }
 
             try {
                 weatherData = weatherFuture.get(10, TimeUnit.SECONDS);
-            } catch (TimeoutException te) {
-                LOGGER.log(Level.WARNING, "[OrchestratorAgent] Weather agent timeout for corrId=" + corrId, te);
+            } catch (TimeoutException | InterruptedException | ExecutionException te) {
+                LOGGER.log(Level.WARNING, "[OrchestratorAgent] Weather agent timeout/error for corrId=" + corrId);
             }
 
             // Cleanup futures
@@ -174,9 +197,12 @@ public class OrchestratorAgent {
             if (travelData == null) travelData = new HashMap<>();
             if (weatherData == null) weatherData = new HashMap<>();
 
+            // Fallback: create empty risk data if not available
+            Map<String, Object> riskData = new HashMap<>();
+
             // Call ActivityPlannerAgent with collected data
             LOGGER.info("[OrchestratorAgent] Calling ActivityPlannerAgent.handleCoordinatedQuery");
-            Map<String, Object> activityResponse = com.anupam.activity.planner.agent.ActivityPlannerAgent.handleCoordinatedQuery(city, travelData, weatherData);
+            Map<String, Object> activityResponse = com.anupam.activity.planner.agent.ActivityPlannerAgent.handleCoordinatedQuery(city, travelData, weatherData, riskData);
 
             if (activityResponse != null && activityResponse.containsKey("response")) {
                 coordinatedResponse.put("response", activityResponse.get("response"));
@@ -198,16 +224,16 @@ public class OrchestratorAgent {
     }
 
     /**
-     * ActivityPlannerAgent calls TravelAgent and WeatherAgent in parallel
+     * ActivityPlannerAgent calls TravelAgent, WeatherAgent, and RiskAssessmentAgent in parallel
      */
     public static Map<String, Object> callActivityAgentWithCoordination(String city) {
         Map<String, Object> combinedResponse = new HashMap<>();
         combinedResponse.put("orchestrator", "orchestrator-agent");
         combinedResponse.put("city", city);
-        combinedResponse.put("coordination_type", "activity-travel-weather");
+        combinedResponse.put("coordination_type", "activity-travel-weather-risk");
 
-        // Create thread pool for parallel execution
-        ExecutorService executorService = Executors.newFixedThreadPool(2);
+        // Create thread pool for parallel execution (3 agents: travel, weather, risk)
+        ExecutorService executorService = Executors.newFixedThreadPool(3);
 
         try {
             LOGGER.info(() -> "[OrchestratorAgent] Starting parallel coordination for city: " + city);
@@ -242,52 +268,59 @@ public class OrchestratorAgent {
                 }
             });
 
-            // Wait for both to complete with timeout
-            LOGGER.info("[OrchestratorAgent] Waiting for both agents to complete (timeout: 10s)");
+            // Task 3: Call RiskAssessmentAgent
+            Future<Map<String, Object>> riskFuture = executorService.submit(() -> {
+                try {
+                    String riskQuery = "Assess travel risks for " + city + " including weather hazards, peak season costs, and alternative timing";
+                    LOGGER.info(() -> "[OrchestratorAgent] Calling RiskAssessmentAgent with query: " + riskQuery);
+                    Map<String, Object> result = AgentRegistry.routeToAgent("risk-agent", riskQuery);
+                    LOGGER.info(() -> "[OrchestratorAgent] RiskAssessmentAgent returned: " +
+                        (result != null ? result.keySet() : "null"));
+                    return result;
+                } catch (Exception e) {
+                    LOGGER.log(Level.SEVERE, "[OrchestratorAgent] ERROR in RiskAssessmentAgent: " + e.getMessage(), e);
+                    throw e;
+                }
+            });
+
+            // Wait for all three to complete with timeout
+            LOGGER.info("[OrchestratorAgent] Waiting for all agents to complete (timeout: 10s)");
             Map<String, Object> travelResponse = travelFuture.get(10, TimeUnit.SECONDS);
             Map<String, Object> weatherResponse = weatherFuture.get(10, TimeUnit.SECONDS);
-            LOGGER.info("[OrchestratorAgent] Both agents completed successfully");
+            Map<String, Object> riskResponse = riskFuture.get(10, TimeUnit.SECONDS);
+            LOGGER.info("[OrchestratorAgent] All agents completed successfully");
 
-            // Extract the actual response data from both agents
+            // Extract the actual response data from all agents
             // Handle both Map and String responses
             Object travelResponseObj = travelResponse.get("response");
             Object weatherResponseObj = weatherResponse.get("response");
+            Object riskResponseObj = riskResponse.get("response");
 
             LOGGER.info(() -> "[OrchestratorAgent] Travel response type: " +
                 (travelResponseObj != null ? travelResponseObj.getClass().getSimpleName() : "null"));
             LOGGER.info(() -> "[OrchestratorAgent] Weather response type: " +
                 (weatherResponseObj != null ? weatherResponseObj.getClass().getSimpleName() : "null"));
+            LOGGER.info(() -> "[OrchestratorAgent] Risk response type: " +
+                (riskResponseObj != null ? riskResponseObj.getClass().getSimpleName() : "null"));
 
-            // Convert to Map if needed
-            Map<String, Object> travelData;
-            if (travelResponseObj instanceof Map) {
-                travelData = (Map<String, Object>) travelResponseObj;
-            } else {
-                travelData = new HashMap<>();
-                if (travelResponseObj instanceof String) {
-                    travelData.put("text", travelResponseObj);
-                    LOGGER.info("[OrchestratorAgent] Travel response was String, wrapped in Map");
-                }
-            }
-
-            Map<String, Object> weatherData;
-            if (weatherResponseObj instanceof Map) {
-                weatherData = (Map<String, Object>) weatherResponseObj;
-            } else {
-                weatherData = new HashMap<>();
-                if (weatherResponseObj instanceof String) {
-                    weatherData.put("text", weatherResponseObj);
-                    LOGGER.info("[OrchestratorAgent] Weather response was String, wrapped in Map");
-                }
-            }
+            // Convert to Map - keep the actual weather data structure
+            Map<String, Object> travelData = (travelResponseObj instanceof Map) ? 
+                (Map<String, Object>) travelResponseObj : new HashMap<>();
+            
+            Map<String, Object> weatherData = (weatherResponseObj instanceof Map) ? 
+                (Map<String, Object>) weatherResponseObj : new HashMap<>();
+            
+            Map<String, Object> riskData = (riskResponseObj instanceof Map) ? 
+                (Map<String, Object>) riskResponseObj : new HashMap<>();
 
             LOGGER.info(() -> "[OrchestratorAgent] Travel data: " + (travelData != null && !travelData.isEmpty() ? "present" : "empty"));
             LOGGER.info(() -> "[OrchestratorAgent] Weather data: " + (weatherData != null && !weatherData.isEmpty() ? "present" : "empty"));
+            LOGGER.info(() -> "[OrchestratorAgent] Risk data: " + (riskData != null && !riskData.isEmpty() ? "present" : "empty"));
 
             // Call ActivityPlannerAgent.handleCoordinatedQuery directly with combined data
             LOGGER.info("[OrchestratorAgent] Calling ActivityPlannerAgent.handleCoordinatedQuery");
             Map<String, Object> activityResponse =
-                com.anupam.activity.planner.agent.ActivityPlannerAgent.handleCoordinatedQuery(city, travelData, weatherData);
+                com.anupam.activity.planner.agent.ActivityPlannerAgent.handleCoordinatedQuery(city, travelData, weatherData, riskData);
 
             LOGGER.info(() -> "[OrchestratorAgent] ActivityPlannerAgent returned: " +
                 (activityResponse != null ? activityResponse.keySet() : "null"));
